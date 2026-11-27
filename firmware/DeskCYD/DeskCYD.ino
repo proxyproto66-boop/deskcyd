@@ -504,7 +504,10 @@ struct TouchState {
   bool moved = false;
   int listScroll0 = 0;
   bool longDone = false;
+  bool swipeOk = false;   // touch started in the swipe zone
 } tch;
+
+#define SWIPE_H 72   // swipe zone: top ~0.5 inch of the screen (2.8" panel is ~143 px per inch)
 
 void applyRotation() {
   gfx->setRotation(ui.flipped ? 3 : 1);
@@ -523,6 +526,7 @@ void redrawIcons() { drawRegion(TX - 8, ICON_CY - 16, SCR_W - TX + 8, 34); }
 
 void onTouchDown(int x, int y) {
   tch.kind = T_NONE;
+  tch.swipeOk = false;
   if (ui.status[0] || ui.otaProgress >= 0) return;
 
   if (ui.plOpen) {
@@ -530,6 +534,8 @@ void onTouchDown(int x, int y) {
     if (y >= PL_TOP) { tch.kind = T_LIST; tch.listScroll0 = ui.plScroll; }
     return;
   }
+  // A sideways drag that starts in this zone changes page; a tap still goes to whatever is under the finger.
+  tch.swipeOk = y < SWIPE_H;
   if (y < TOP_H + 6) { tch.kind = T_TOP; return; }
 
   if (ui.page == 0 && ui.active) {
@@ -585,15 +591,15 @@ void onTouchDown(int x, int y) {
 void onTouchMove(int x, int y) {
   int dx = x - tch.x0, dy = y - tch.y0;
   if (abs(dx) > 8 || abs(dy) > 8) tch.moved = true;
+  if (tch.swipeOk && tch.kind != T_SCRUB && tch.kind != T_LIST && abs(dx) > 40 && abs(dx) > abs(dy)) {
+    int dir = dx < 0 ? 1 : -1;   // finger moves left -> next page
+    int np = (ui.page + dir + NUM_PAGES) % NUM_PAGES;
+    tch.swipeOk = false;
+    tch.kind = T_NONE;
+    slideTo(np, dir);
+    return;
+  }
   switch (tch.kind) {
-    case T_TOP:
-      if (abs(dx) > 40 && abs(dx) > abs(dy)) {
-        int dir = dx < 0 ? 1 : -1;   // finger moves left -> next page
-        int np = (ui.page + dir + NUM_PAGES) % NUM_PAGES;
-        slideTo(np, dir);
-        tch.kind = T_NONE;
-      }
-      break;
     case T_SCRUB:
       ui.scrubMs = scrubFromX(x);
       redrawBar();

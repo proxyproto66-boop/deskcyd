@@ -22,6 +22,7 @@ if sys.stdout is None or sys.stderr is None:
 import array
 import asyncio
 import base64
+import gzip
 import hashlib
 import io
 import json
@@ -31,6 +32,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -719,12 +721,136 @@ def update_app():
     bat = os.path.join(tempfile.gettempdir(), "deskcyd_update.bat")
     with open(bat, "w") as fh:
         fh.write("@echo off\r\n"
-                 "timeout /t 2 /nobreak >nul\r\n"
+                 "ping -n 3 127.0.0.1 >nul\r\n"
                  f'move /y "{new}" "{exe}" >nul\r\n'
                  f'start "" "{exe}"\r\n'
                  'del "%~f0"\r\n')
-    subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000)   # no window
+    # Start the new copy with a clean environment. Otherwise it inherits this copy's
+    # PyInstaller settings and looks for its files in our temp folder, which is being deleted
+    # ("Failed to load Python DLL").
+    env = {k: v for k, v in os.environ.items()
+           if not k.upper().startswith(("_MEI", "_PYI")) and k.upper() not in ("TCL_LIBRARY", "TK_LIBRARY")}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000, env=env)   # no window
     os._exit(0)
+
+
+# =====================================================================
+# Weather (Open-Meteo, free, no key) and the location picker
+# =====================================================================
+_wx_cache = {}      # (lat, lon) -> (time, reply)
+_near_cache = {"t": 0, "v": None}
+_cities = None
+
+
+def http_json(url, timeout=10):
+    req = urllib.request.Request(url, headers={"User-Agent": f"DeskCYD/{APP_VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def near_my_pc():
+    """Rough location of this PC from its internet address: (city, lat, lon)."""
+    if _near_cache["v"] and time.time() - _near_cache["t"] < 6 * 3600:
+        return _near_cache["v"]
+    v = None
+    try:
+        d = http_json("https://ipwho.is/")
+        if d.get("success"):
+            v = (d.get("city") or "Near my PC", float(d["latitude"]), float(d["longitude"]))
+    except Exception as e:
+        print("ipwho.is failed:", e)
+    if v is None:
+        try:
+            d = http_json("http://ip-api.com/json/")
+            if d.get("status") == "success":
+                v = (d.get("city") or "Near my PC", float(d["lat"]), float(d["lon"]))
+        except Exception as e:
+            print("ip-api failed:", e)
+    if v:
+        _near_cache.update(t=time.time(), v=v)
+    return v
+
+
+def get_weather(lat, lon, name):
+    key = (round(lat, 2), round(lon, 2))
+    hit = _wx_cache.get(key)
+    if hit and time.time() - hit[0] < 9 * 60:
+        reply = dict(hit[1])
+        reply["city"] = name
+        return reply
+    q = urllib.parse.urlencode({
+        "latitude": f"{lat:.4f}", "longitude": f"{lon:.4f}",
+        "current": "temperature_2m,weather_code,is_day",
+        "hourly": "temperature_2m,weather_code,is_day",
+        "daily": "temperature_2m_max,temperature_2m_min",
+        "timezone": "auto", "forecast_days": 2,
+    })
+    d = http_json("https://api.open-meteo.com/v1/forecast?" + q)
+    cur = d["current"]
+    hourly = d["hourly"]
+    hours = []
+    for i, t in enumerate(hourly["time"]):
+        if t > cur["time"] and len(hours) < 4:
+            hours.append([int(t[11:13]), int(hourly["weather_code"][i] or 0), int(hourly["is_day"][i] or 0),
+                          round(float(hourly["temperature_2m"][i]), 1)])
+    reply = {
+        "ok": True, "city": name, "lat": lat, "lon": lon,
+        "t": round(float(cur["temperature_2m"]), 1), "code": int(cur["weather_code"] or 0),
+        "day": int(cur.get("is_day", 1)),
+        "hi": round(float(d["daily"]["temperature_2m_max"][0]), 1),
+        "lo": round(float(d["daily"]["temperature_2m_min"][0]), 1),
+        "h": hours,
+    }
+    _wx_cache[key] = (time.time(), reply)
+    return reply
+
+
+def cities():
+    global _cities
+    if _cities is None:
+        try:
+            with gzip.open(resource("cities.json.gz"), "rb") as fh:
+                _cities = json.loads(fh.read())
+        except Exception as e:
+            print("city list missing:", e)
+            _cities = {"regions": [], "countries": {}, "states": {}, "cities": {}}
+    return _cities
+
+
+LOC_MAX_ITEMS = 1000
+LOC_MAX_BYTES = 23000
+
+
+def loc_list(r, c, s):
+    """Text list for the CYD's location picker. First line: type<TAB>title."""
+    data = cities()
+    lines = []
+    if not r:
+        kind, title = "R", "Location"
+        lines.append("Near my PC\t*")
+        lines += [f"{name}\t{code}" for name, code in data["regions"]]
+    elif not c:
+        kind = "C"
+        title = next((n for n, code in data["regions"] if code == r), "Countries")
+        lines += [f"{name}\t{code}" for name, code, _ in data["countries"].get(r, [])]
+    else:
+        cinfo = next((x for x in data["countries"].get(r, []) if x[1] == c), None)
+        cname = cinfo[0] if cinfo else c
+        if cinfo and cinfo[2] and not s:
+            kind, title = "S", cname
+            lines += [f"{name}\t{code}" for name, code in data["states"].get(c, [])]
+        else:
+            kind = "Y"
+            key = f"{c}.{s}" if s else c
+            title = next((n for n, code in data["states"].get(c, []) if code == s), cname) if s else cname
+            lines += [f"{name}\t{lat}\t{lon}" for name, lat, lon in data["cities"].get(key, [])]
+    out = f"{kind}\t{title}\n"
+    for ln in lines[:LOC_MAX_ITEMS]:
+        if len(out) + len(ln) + 1 > LOC_MAX_BYTES:
+            break
+        out += ln + "\n"
+    return out.encode("ascii", "replace")
 
 
 # =====================================================================
@@ -789,6 +915,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(spotify.playlists() if spotify.connected() else [])
         elif p == "/api/addto":
             self._json(self.add_to(q.get("id", [""])[0]))
+        elif p == "/api/weather":
+            self._json(self.weather(q))
+        elif p == "/api/loc":
+            g = lambda k: q.get(k, [""])[0]
+            self._send(200, loc_list(g("r"), g("c"), g("s")), "text/plain")
         elif p == "/api/firmware":
             try:
                 with open(fw_file, "rb") as fh:
@@ -798,6 +929,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, b"no firmware", "text/plain")
         else:
             self._send(200, b"DeskCYD companion is running.", "text/plain")
+
+    def weather(self, q):
+        try:
+            if q.get("near", ["0"])[0] == "1":
+                n = near_my_pc()
+                if not n:
+                    return {"ok": False}
+                name, lat, lon = n
+            else:
+                lat = float(q.get("lat", ["0"])[0])
+                lon = float(q.get("lon", ["0"])[0])
+                name = q.get("name", [""])[0]
+            name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()[:30] or "Near my PC"
+            return get_weather(lat, lon, name)
+        except Exception as e:
+            print("weather error:", e)
+            return {"ok": False}
 
     def like(self):
         if not spotify.connected():

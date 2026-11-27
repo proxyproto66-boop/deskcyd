@@ -1,0 +1,93 @@
+name: Build and publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  ESP32_URL: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install ESP32 core and libraries
+        run: |
+          arduino-cli core update-index --additional-urls "$ESP32_URL"
+          arduino-cli core install esp32:esp32 --additional-urls "$ESP32_URL"
+          arduino-cli lib install LovyanGFX XPT2046_Touchscreen ArduinoJson WiFiManager
+      - name: Compile
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs \
+            --additional-urls "$ESP32_URL" --output-dir build firmware/DeskCYD
+          ls -la build
+      - name: Make single flashable image
+        run: |
+          if [ -f build/DeskCYD.ino.merged.bin ]; then
+            cp build/DeskCYD.ino.merged.bin DeskCYD.bin
+          else
+            pip install esptool
+            BOOT_APP0=$(find ~/.arduino15 -name boot_app0.bin | head -1)
+            python -m esptool --chip esp32 merge_bin -o DeskCYD.bin \
+              --flash_mode dio --flash_freq 40m --flash_size 4MB \
+              0x1000 build/DeskCYD.ino.bootloader.bin \
+              0x8000 build/DeskCYD.ino.partitions.bin \
+              0xe000 "$BOOT_APP0" \
+              0x10000 build/DeskCYD.ino.bin
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: DeskCYD.bin
+
+  pc-app:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install packages
+        run: pip install winsdk pillow pystray pyinstaller
+      - name: Build DeskCYD.exe
+        run: pyinstaller --onefile --noconsole --name DeskCYD --hidden-import pystray._win32 pc/deskcyd.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pc-app
+          path: dist/DeskCYD.exe
+
+  publish:
+    needs: [firmware, pc-app]
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+      - name: Assemble site
+        run: |
+          mkdir site
+          cp web/* site/
+          cp dl/firmware/DeskCYD.bin site/
+          cp dl/pc-app/DeskCYD.exe site/
+          sed -i "s/__VERSION__/${GITHUB_RUN_NUMBER}/g" site/manifest.json site/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4

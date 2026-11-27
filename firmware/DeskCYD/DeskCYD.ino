@@ -17,7 +17,7 @@
 #define PC_IP_MANUAL  ""
 #define PC_PORT_MANUAL 8765
 
-// Screen chip: 0 = detect automatically, 1 = force ILI9341 (micro-USB CYD), 2 = force ST7789 (USB-C CYD)
+// Screen type: 0 = detect automatically, 1 = force original CYD (micro-USB), 2 = force USB-C / 2-USB CYD
 #define FORCE_PANEL 0
 // =========================================================
 
@@ -32,22 +32,25 @@
 #include <LovyanGFX.hpp>
 
 // ---------------- display + touch driver setup for the CYD ----------------
-// The original CYD uses an ILI9341 screen; the newer USB-C versions use an ST7789.
+// The original CYD uses an ILI9341 screen in portrait. The newer USB-C / 2-USB versions use a
+// panel that behaves like an ILI9342 (landscape-native, colors inverted).
 // Both are set up here and the right one is picked at startup.
 class LGFX : public lgfx::LGFX_Device {
   lgfx::Panel_ILI9341 _ili;
-  lgfx::Panel_ST7789 _st;
+  lgfx::Panel_ILI9342 _alt;
   lgfx::Bus_SPI _bus;
   lgfx::Light_PWM _light;
   lgfx::Touch_XPT2046 _touch;
 
-  void setupPanel(lgfx::Panel_Device &p, bool invert) {
+  void setupPanel(lgfx::Panel_Device &p, bool invert, int w, int h) {
     auto cfg = p.config();
     cfg.pin_cs = 15;
     cfg.pin_rst = -1;
     cfg.pin_busy = -1;
-    cfg.panel_width = 240;
-    cfg.panel_height = 320;
+    cfg.panel_width = w;
+    cfg.panel_height = h;
+    cfg.memory_width = w;
+    cfg.memory_height = h;
     cfg.offset_x = 0;
     cfg.offset_y = 0;
     cfg.offset_rotation = 0;
@@ -104,23 +107,23 @@ public:
       cfg.pin_cs = 33;
       _touch.config(cfg);
     }
-    setupPanel(_ili, false);
-    setupPanel(_st, true);    // ST7789 panels need color inversion
+    setupPanel(_ili, false, 240, 320);
+    setupPanel(_alt, true, 320, 240);   // 2-USB panels need color inversion
     setPanel(&_ili);
   }
 
-  void useST7789(bool st) {
-    if (st) setPanel(&_st);
+  void useAltPanel(bool alt) {
+    if (alt) setPanel(&_alt);
     else setPanel(&_ili);
   }
 };
 
 LGFX tft;
-bool panelIsST7789 = false;
+bool altPanel = false;   // true on USB-C / 2-USB CYDs
 
 // Ask the screen chip for its ID before starting the display driver.
-// ST7789 answers 0x85 0x85 0x52; ILI9341 answers zeros to this command.
-bool detectST7789() {
+// The 2-USB panels answer 0x85 0x85 0x52; the original ILI9341 answers zeros to this command.
+bool detectAltPanel() {
   pinMode(15, OUTPUT);
   digitalWrite(15, HIGH);
   pinMode(2, OUTPUT);
@@ -143,7 +146,8 @@ bool detectST7789() {
 }
 
 Preferences prefs;
-uint8_t screenRotation = 0;   // 0 or 2 (portrait, flipped 180)
+bool screenFlipped = false;   // portrait, or portrait turned 180 degrees
+uint8_t screenRotation = 0;
 
 // ---------------- network ----------------
 #define DISCOVERY_PORT 47800
@@ -424,10 +428,16 @@ unsigned long touchStart = 0;
 bool longPressDone = false;
 unsigned long lastTap = 0;
 
-void flipScreen() {
-  screenRotation = (screenRotation == 0) ? 2 : 0;
-  prefs.putUChar("rot", screenRotation);
+// Portrait is rotation 0/2 on the original panel and 1/3 on the landscape-native 2-USB panel.
+void applyRotation() {
+  screenRotation = (altPanel ? 1 : 0) + (screenFlipped ? 2 : 0);
   tft.setRotation(screenRotation);
+}
+
+void flipScreen() {
+  screenFlipped = !screenFlipped;
+  prefs.putBool("flip", screenFlipped);
+  applyRotation();
   statusShown = "";
   nowPlayingOnScreen = false;   // forces a full redraw
 }
@@ -480,7 +490,7 @@ void calibrateTouch() {
   tft.setTextDatum(textdatum_t::top_left);
   tft.calibrateTouch(cal, 0xFFFFu, 0x0000u, 22);
   tft.setTouchCalibrate(cal);
-  prefs.putBytes("cal", cal, sizeof(cal));
+  prefs.putBytes("cal2", cal, sizeof(cal));
   int32_t tx, ty;
   while (tft.getTouch(&tx, &ty)) delay(10);   // wait for the finger to lift
   statusShown = "";
@@ -553,25 +563,24 @@ void setup() {
   Serial.begin(115200);
 
 #if FORCE_PANEL == 1
-  panelIsST7789 = false;
+  altPanel = false;
 #elif FORCE_PANEL == 2
-  panelIsST7789 = true;
+  altPanel = true;
 #else
-  panelIsST7789 = detectST7789();
+  altPanel = detectAltPanel();
 #endif
-  Serial.println(panelIsST7789 ? "Screen: ST7789" : "Screen: ILI9341");
-  tft.useST7789(panelIsST7789);
+  Serial.println(altPanel ? "Screen: 2-USB (ILI9342 mode)" : "Screen: original ILI9341");
+  tft.useAltPanel(altPanel);
   tft.init();
 
   prefs.begin("deskcyd", false);
-  screenRotation = prefs.getUChar("rot", 0);
-  if (screenRotation != 0 && screenRotation != 2) screenRotation = 0;
-  tft.setRotation(screenRotation);
+  screenFlipped = prefs.getBool("flip", false);
+  applyRotation();
   tft.setBrightness(200);
   tft.fillScreen(0x0000);
 
   uint16_t cal[8];
-  if (prefs.getBytes("cal", cal, sizeof(cal)) == sizeof(cal)) tft.setTouchCalibrate(cal);
+  if (prefs.getBytes("cal2", cal, sizeof(cal)) == sizeof(cal)) tft.setTouchCalibrate(cal);
   else calibrateTouch();
 
   if (strlen(PC_IP_MANUAL) > 0) {

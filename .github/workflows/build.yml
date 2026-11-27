@@ -26,8 +26,8 @@ jobs:
       - name: Install ESP32 core and libraries
         run: |
           arduino-cli core update-index --additional-urls "$ESP32_URL"
-          arduino-cli core install esp32:esp32@3.0.7 --additional-urls "$ESP32_URL"
-          arduino-cli lib install LovyanGFX XPT2046_Touchscreen ArduinoJson WiFiManager
+          arduino-cli core install esp32:esp32 --additional-urls "$ESP32_URL"
+          arduino-cli lib install "GFX Library for Arduino" XPT2046_Touchscreen ArduinoJson WiFiManager JPEGDEC
       - name: Compile
         run: |
           arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs \

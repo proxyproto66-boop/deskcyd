@@ -17,6 +17,9 @@ concurrency:
 env:
   ESP32_URL: https://espressif.github.io/arduino-esp32/package_esp32_index.json
   FIGTREE_URL: https://raw.githubusercontent.com/google/fonts/main/ofl/figtree/Figtree%5Bwght%5D.ttf
+  NASA_DAY_URL: https://assets.science.nasa.gov/content/dam/science/esd/eo/images/bmng/bmng-topography-bathymetry/september/world.topo.bathy.200409.3x5400x2700.jpg
+  NASA_NIGHT_URL: https://assets.science.nasa.gov/content/dam/science/esd/eo/images/imagerecords/144000/144898/BlackMarble_2016_3km.jpg
+  GEONAMES: https://download.geonames.org/export/dump
 
 jobs:
   firmware:
@@ -29,11 +32,14 @@ jobs:
           arduino-cli core update-index --additional-urls "$ESP32_URL"
           arduino-cli core install esp32:esp32 --additional-urls "$ESP32_URL"
           arduino-cli lib install "GFX Library for Arduino" XPT2046_Touchscreen ArduinoJson WiFiManager
-      - name: Generate fonts and set version
+      - name: Generate fonts, map pictures and set version
         run: |
           pip install pillow
           curl -sSL -o Figtree.ttf "$FIGTREE_URL"
           python tools/make_fonts.py Figtree.ttf firmware/DeskCYD/fonts.h
+          curl -fsSL --retry 3 -o day.jpg "$NASA_DAY_URL"
+          curl -fsSL --retry 3 -o night.jpg "$NASA_NIGHT_URL"
+          python tools/make_map.py day.jpg night.jpg firmware/DeskCYD/mapdata.h preview
           sed -i "s/^#define FW_VERSION 0$/#define FW_VERSION ${GITHUB_RUN_NUMBER}/" firmware/DeskCYD/DeskCYD.ino
           grep -n "define FW_VERSION" firmware/DeskCYD/DeskCYD.ino
       - name: Compile
@@ -56,12 +62,21 @@ jobs:
               0x10000 build/DeskCYD.ino.bin
           fi
           cp build/DeskCYD.ino.bin DeskCYD-app.bin
+          ls -la DeskCYD-app.bin
+      - name: Draw page previews (same layout code, run on the PC)
+        run: |
+          cd tools/preview
+          cp ../../firmware/DeskCYD/{canvas.h,ui.h,fonts.h,mapdata.h} .
+          g++ -O2 -I. preview.cpp -o preview && ./preview
+          python -c "import glob; from PIL import Image; [Image.open(f).resize((640, 480), Image.NEAREST).save('../../preview/' + f[:-4] + '.png') for f in glob.glob('*.ppm')]"
+          ls -la ../../preview
       - uses: actions/upload-artifact@v4
         with:
           name: firmware
           path: |
             DeskCYD.bin
             DeskCYD-app.bin
+            preview/*.png
 
   pc-app:
     runs-on: windows-latest
@@ -76,10 +91,15 @@ jobs:
         shell: bash
         run: |
           curl -sSL -o pc/Figtree.ttf "$FIGTREE_URL"
+          curl -fsSL --retry 3 -o cities15000.zip "$GEONAMES/cities15000.zip"
+          curl -fsSL --retry 3 -o admin1CodesASCII.txt "$GEONAMES/admin1CodesASCII.txt"
+          curl -fsSL --retry 3 -o countryInfo.txt "$GEONAMES/countryInfo.txt"
+          python -c "import zipfile; zipfile.ZipFile('cities15000.zip').extractall()"
+          python tools/make_cities.py cities15000.txt admin1CodesASCII.txt countryInfo.txt pc/cities.json.gz
           sed -i "s/^APP_VERSION = 0 /APP_VERSION = ${GITHUB_RUN_NUMBER} /" pc/deskcyd.py
           grep -n "^APP_VERSION" pc/deskcyd.py
       - name: Build DeskCYD.exe
-        run: pyinstaller --onefile --noconsole --name DeskCYD --hidden-import pystray._win32 --add-data "pc/Figtree.ttf;." pc/deskcyd.py
+        run: pyinstaller --onefile --noconsole --name DeskCYD --hidden-import pystray._win32 --add-data "pc/Figtree.ttf;." --add-data "pc/cities.json.gz;." pc/deskcyd.py
       - uses: actions/upload-artifact@v4
         with:
           name: pc-app
@@ -99,6 +119,7 @@ jobs:
           cp web/* site/
           cp dl/firmware/DeskCYD.bin dl/firmware/DeskCYD-app.bin site/
           cp dl/pc-app/DeskCYD.exe site/
+          mkdir -p site/preview && cp dl/firmware/preview/*.png site/preview/
           echo "{\"version\": ${GITHUB_RUN_NUMBER}}" > site/version.json
           # keep the last known-good simple version (v9) available as a fallback
           LIVE=https://proxyproto66-boop.github.io/deskcyd

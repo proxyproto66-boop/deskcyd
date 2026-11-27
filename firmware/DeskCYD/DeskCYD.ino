@@ -1,12 +1,19 @@
 /*
-  DeskCYD - Stage 1 (Now Playing)
-  For the ESP32-2432S028 "Cheap Yellow Display".
+  DeskCYD - Stage 1 (Now Playing), landscape
+  For the ESP32-2432S028 "Cheap Yellow Display" (all versions).
 
-  Normally installed from the DeskCYD web page (built automatically by GitHub).
-  Wi-Fi is set up on first boot: join the "DeskCYD-Setup" network from a phone.
-  To forget the saved Wi-Fi, hold BOOT during the first 2 seconds after power-on.
-  To redo touch calibration, touch the screen during those 2 seconds.
-  Hold the album art for 2 seconds to flip the screen upside down.
+  First start:
+    1. Screen setup  - press BOOT to step through options until the screen looks right,
+                       then HOLD BOOT for 2 seconds to save. Then pick colors the same way.
+    2. Touch setup   - tap the arrow in each corner.
+    3. Wi-Fi setup   - join the "DeskCYD-Setup" network from your phone.
+
+  During "Starting..." (first 2 seconds after power-on):
+    - touch the screen          -> redo touch setup
+    - press BOOT briefly        -> redo screen setup
+    - hold BOOT for 5 seconds   -> forget Wi-Fi
+
+  Hold the album art for 2 seconds to turn the picture upside down.
 
   Libraries: LovyanGFX, ArduinoJson (v7), WiFiManager (tzapu)
   Board: ESP32 Dev Module, Partition scheme: Minimal SPIFFS (with OTA)
@@ -16,9 +23,6 @@
 // Leave empty to find the PC automatically. Or put its IP, e.g. "192.168.1.50"
 #define PC_IP_MANUAL  ""
 #define PC_PORT_MANUAL 8765
-
-// Screen type: 0 = detect automatically, 1 = force original CYD (micro-USB), 2 = force USB-C / 2-USB CYD
-#define FORCE_PANEL 0
 // =========================================================
 
 #include <WiFi.h>
@@ -32,38 +36,11 @@
 #include <LovyanGFX.hpp>
 
 // ---------------- display + touch driver setup for the CYD ----------------
-// The original CYD uses an ILI9341 screen in portrait. The newer USB-C / 2-USB versions use a
-// panel that behaves like an ILI9342 (landscape-native, colors inverted).
-// Both are set up here and the right one is picked at startup.
 class LGFX : public lgfx::LGFX_Device {
-  lgfx::Panel_ILI9341 _ili;
-  lgfx::Panel_ILI9342 _alt;
+  lgfx::Panel_ILI9341 _panel;
   lgfx::Bus_SPI _bus;
   lgfx::Light_PWM _light;
   lgfx::Touch_XPT2046 _touch;
-
-  void setupPanel(lgfx::Panel_Device &p, bool invert, int w, int h) {
-    auto cfg = p.config();
-    cfg.pin_cs = 15;
-    cfg.pin_rst = -1;
-    cfg.pin_busy = -1;
-    cfg.panel_width = w;
-    cfg.panel_height = h;
-    cfg.memory_width = w;
-    cfg.memory_height = h;
-    cfg.offset_x = 0;
-    cfg.offset_y = 0;
-    cfg.offset_rotation = 0;
-    cfg.readable = true;
-    cfg.invert = invert;
-    cfg.rgb_order = false;
-    cfg.dlen_16bit = false;
-    cfg.bus_shared = false;
-    p.config(cfg);
-    p.setBus(&_bus);
-    p.setLight(&_light);
-    p.setTouch(&_touch);
-  }
 
 public:
   LGFX() {
@@ -81,6 +58,24 @@ public:
       cfg.pin_miso = 12;
       cfg.pin_dc = 2;
       _bus.config(cfg);
+      _panel.setBus(&_bus);
+    }
+    {
+      auto cfg = _panel.config();
+      cfg.pin_cs = 15;
+      cfg.pin_rst = -1;
+      cfg.pin_busy = -1;
+      cfg.panel_width = 240;
+      cfg.panel_height = 320;
+      cfg.offset_x = 0;
+      cfg.offset_y = 0;
+      cfg.offset_rotation = 0;
+      cfg.readable = true;
+      cfg.invert = false;
+      cfg.rgb_order = false;
+      cfg.dlen_16bit = false;
+      cfg.bus_shared = false;
+      _panel.config(cfg);
     }
     {
       auto cfg = _light.config();
@@ -89,6 +84,7 @@ public:
       cfg.freq = 44100;
       cfg.pwm_channel = 7;
       _light.config(cfg);
+      _panel.setLight(&_light);
     }
     {
       auto cfg = _touch.config();   // touch has its own SPI bus on the CYD
@@ -106,48 +102,55 @@ public:
       cfg.pin_miso = 39;
       cfg.pin_cs = 33;
       _touch.config(cfg);
+      _panel.setTouch(&_touch);
     }
-    setupPanel(_ili, false, 240, 320);
-    setupPanel(_alt, true, 320, 240);   // 2-USB panels need color inversion
-    setPanel(&_ili);
-  }
-
-  void useAltPanel(bool alt) {
-    if (alt) setPanel(&_alt);
-    else setPanel(&_ili);
+    setPanel(&_panel);
   }
 };
 
 LGFX tft;
-bool altPanel = false;   // true on USB-C / 2-USB CYDs
+Preferences prefs;
 
-// Ask the screen chip for its ID before starting the display driver.
-// The 2-USB panels answer 0x85 0x85 0x52; the original ILI9341 answers zeros to this command.
-bool detectAltPanel() {
-  pinMode(15, OUTPUT);
-  digitalWrite(15, HIGH);
-  pinMode(2, OUTPUT);
-  SPIClass probe(HSPI);
-  probe.begin(14, 12, 13, -1);
-  probe.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
-  digitalWrite(15, LOW);
-  digitalWrite(2, LOW);
-  probe.transfer(0x04);   // RDDID
-  digitalWrite(2, HIGH);
-  uint32_t raw = probe.transfer32(0);
-  digitalWrite(15, HIGH);
-  probe.endTransaction();
-  probe.end();
-  Serial.printf("Panel ID read: 0x%08X\n", raw);
-  for (int sh = 0; sh <= 16; sh++) {
-    if (((raw >> sh) & 0xFFFF) == 0x8585) return true;
-  }
-  return false;
+// ---------------- screen orientation / color settings ----------------
+// Different CYD versions have their screen wired differently, so instead of guessing
+// we write the screen's orientation register (MADCTL) directly and let the user pick.
+// The drawing area is always 320 x 240 (landscape).
+const uint8_t ORIENT_OPTIONS[8] = { 0x20, 0x60, 0xA0, 0xE0, 0x00, 0x40, 0x80, 0xC0 };
+const int NUM_ORIENT = 8;
+// color options: bit0 = BGR order, bit1 = inverted
+const int NUM_COLOR = 4;
+int orientIdx = 0;
+int colorIdx = 1;           // BGR, not inverted = original CYD
+bool screenFlipped = false; // picture turned 180 degrees
+
+void applyScreenSettings() {
+  uint8_t mad = ORIENT_OPTIONS[orientIdx];
+  if (screenFlipped) mad ^= 0xC0;           // MX + MY = rotate 180
+  if (colorIdx & 1) mad |= 0x08;            // BGR
+  tft.startWrite();
+  tft.writeCommand(0x36);                   // MADCTL
+  tft.writeData(mad);
+  tft.writeCommand((colorIdx & 2) ? 0x21 : 0x20);   // inversion on / off
+  tft.endWrite();
 }
 
-Preferences prefs;
-bool screenFlipped = false;   // portrait, or portrait turned 180 degrees
-uint8_t screenRotation = 0;
+// ---------------- buttons ----------------
+const int BOOT_PIN = 0;
+bool bootDown() { return digitalRead(BOOT_PIN) == LOW; }
+
+// Waits for a BOOT press. Returns 1 for a short press, 2 for a hold of 2 s or more.
+int waitBootPress() {
+  while (!bootDown()) delay(10);
+  unsigned long t = millis();
+  while (bootDown()) {
+    if (millis() - t > 2000) {
+      while (bootDown()) delay(10);
+      return 2;
+    }
+    delay(10);
+  }
+  return 1;
+}
 
 // ---------------- network ----------------
 #define DISCOVERY_PORT 47800
@@ -173,14 +176,13 @@ uint16_t drawnBg = 0;
 String statusShown = "";
 bool nowPlayingOnScreen = false;
 
-// ---------------- layout (portrait, 240 x 320) ----------------
-const int SCR_W = 240;
-const int ART_S = 160, ART_X = (SCR_W - ART_S) / 2, ART_Y = 10;
-const int TITLE_Y = 180, ARTIST_Y = 203;
-const int TXT_W = 220;
-const int BAR_X = 12, BAR_Y = 234, BAR_W = 216, BAR_H = 6;
-const int BTN_Y = 268, BTN_H = 44, BTN_W = 68;
-const int BTN_PREV_X = 10, BTN_PLAY_X = 86, BTN_NEXT_X = 162;
+// ---------------- layout (landscape, 320 x 240) ----------------
+const int SCR_W = 320, SCR_H = 240;
+const int ART_X = 10, ART_Y = 10, ART_S = 150;
+const int TXT_X = 172, TXT_W = 140;
+const int BAR_X = 10, BAR_Y = 172, BAR_W = 300, BAR_H = 6;
+const int BTN_Y = 198, BTN_H = 36, BTN_W = 90;
+const int BTN_PREV_X = 10, BTN_PLAY_X = 115, BTN_NEXT_X = 220;
 
 const uint16_t COL_TEXT = 0xFFFF;
 const uint16_t COL_SUB = 0xC618;
@@ -224,6 +226,70 @@ String fmtTime(int sec) {
 }
 
 // =====================================================================
+// Screen setup (orientation + colors), driven by the BOOT button
+// =====================================================================
+void drawOrientationTest() {
+  tft.fillScreen(0x0000);
+  tft.drawRect(0, 0, SCR_W, SCR_H, 0xFFFF);           // frame around the whole screen
+  tft.drawRect(1, 1, SCR_W - 2, SCR_H - 2, 0xFFFF);
+  // arrow pointing up, on the left
+  tft.fillTriangle(50, 30, 20, 80, 80, 80, 0xFFFF);
+  tft.fillRect(40, 80, 20, 60, 0xFFFF);
+  tft.setTextDatum(textdatum_t::top_left);
+  tft.setTextColor(0xFFFF);
+  tft.setFont(&fonts::FreeSansBold12pt7b);
+  tft.drawString("Screen setup " + String(orientIdx + 1) + "/" + String(NUM_ORIENT), 100, 24);
+  tft.setFont(&fonts::FreeSans9pt7b);
+  tft.drawString("Is this text readable,", 100, 64);
+  tft.drawString("the arrow pointing up,", 100, 86);
+  tft.drawString("and the frame on all", 100, 108);
+  tft.drawString("4 edges of the screen?", 100, 130);
+  tft.drawString("No: press BOOT", 20, 172);
+  tft.drawString("Yes: HOLD BOOT 2 seconds", 20, 200);
+}
+
+void drawColorTest() {
+  tft.fillScreen(0x0000);
+  tft.setTextDatum(textdatum_t::top_left);
+  tft.setTextColor(0xFFFF);
+  tft.setFont(&fonts::FreeSansBold12pt7b);
+  tft.drawString("Colors " + String(colorIdx + 1) + "/" + String(NUM_COLOR), 16, 12);
+  tft.fillRect(16, 50, 90, 70, 0xF800);
+  tft.fillRect(115, 50, 90, 70, 0x07E0);
+  tft.fillRect(214, 50, 90, 70, 0x001F);
+  tft.setFont(&fonts::FreeSans9pt7b);
+  tft.drawString("RED", 40, 126);
+  tft.drawString("GREEN", 128, 126);
+  tft.drawString("BLUE", 238, 126);
+  tft.drawString("Black background, boxes match?", 16, 158);
+  tft.drawString("No: press BOOT", 16, 184);
+  tft.drawString("Yes: HOLD BOOT 2 seconds", 16, 208);
+}
+
+void runScreenSetup() {
+  screenFlipped = false;
+  // 1) orientation
+  while (true) {
+    applyScreenSettings();
+    drawOrientationTest();
+    if (waitBootPress() == 2) break;
+    orientIdx = (orientIdx + 1) % NUM_ORIENT;
+  }
+  // 2) colors
+  while (true) {
+    applyScreenSettings();
+    drawColorTest();
+    if (waitBootPress() == 2) break;
+    colorIdx = (colorIdx + 1) % NUM_COLOR;
+  }
+  prefs.putUChar("orient", orientIdx);
+  prefs.putUChar("color", colorIdx);
+  prefs.putBool("flip", false);
+  prefs.remove("cal3");   // touch must be redone for the new orientation
+  statusShown = "";
+}
+
+// =====================================================================
 // Screens
 // =====================================================================
 void showStatus(const String &msg, const String &sub) {
@@ -232,18 +298,17 @@ void showStatus(const String &msg, const String &sub) {
   statusShown = key;
   nowPlayingOnScreen = false;
   drawnArt = "#"; drawnTitle = "#";
-  int cx = tft.width() / 2, cy = tft.height() / 2;
   tft.fillScreen(0x0000);
   tft.setTextDatum(textdatum_t::middle_center);
   tft.setFont(&fonts::FreeSansBold12pt7b);
-  if (tft.textWidth(msg) > tft.width() - 12) tft.setFont(&fonts::FreeSansBold9pt7b);
+  if (tft.textWidth(msg) > SCR_W - 12) tft.setFont(&fonts::FreeSansBold9pt7b);
   tft.setTextColor(COL_TEXT);
-  tft.drawString(msg, cx, cy - 18);
+  tft.drawString(msg, SCR_W / 2, SCR_H / 2 - 16);
   if (sub.length()) {
     tft.setFont(&fonts::FreeSans9pt7b);
-    if (tft.textWidth(sub) > tft.width() - 12) tft.setFont(&fonts::Font2);
+    if (tft.textWidth(sub) > SCR_W - 12) tft.setFont(&fonts::Font2);
     tft.setTextColor(COL_SUB);
-    tft.drawString(sub, cx, cy + 16);
+    tft.drawString(sub, SCR_W / 2, SCR_H / 2 + 18);
   }
   tft.setTextDatum(textdatum_t::top_left);
 }
@@ -311,28 +376,36 @@ void drawProgress() {
   if (fillW > 0) tft.fillRoundRect(BAR_X, BAR_Y, max(fillW, BAR_H), BAR_H, 3, np.accent);
 
   tft.setFont(&fonts::Font2);
-  tft.fillRect(BAR_X, BAR_Y + 9, BAR_W, 16, np.bg);
+  tft.fillRect(BAR_X, BAR_Y + 8, BAR_W, 16, np.bg);
   tft.setTextColor(COL_SUB, np.bg);
   tft.setTextDatum(textdatum_t::top_left);
-  tft.drawString(fmtTime(np.pos), BAR_X, BAR_Y + 9);
+  tft.drawString(fmtTime(np.pos), BAR_X, BAR_Y + 8);
   tft.setTextDatum(textdatum_t::top_right);
-  tft.drawString(np.dur > 0 ? fmtTime(np.dur) : String("--:--"), BAR_X + BAR_W, BAR_Y + 9);
+  tft.drawString(np.dur > 0 ? fmtTime(np.dur) : String("--:--"), BAR_X + BAR_W, BAR_Y + 8);
   tft.setTextDatum(textdatum_t::top_left);
 }
 
 void drawText() {
-  tft.fillRect(0, TITLE_Y - 4, SCR_W, BAR_Y - TITLE_Y, np.bg);
-  tft.setTextDatum(textdatum_t::top_center);
+  tft.fillRect(TXT_X, ART_Y, SCR_W - TXT_X, ART_S, np.bg);
+  int y = ART_Y + 2;
+
   tft.setFont(&fonts::FreeSansBold9pt7b);
   tft.setTextColor(COL_TEXT);
-  tft.drawString(fitText(np.title.length() ? np.title : String("Unknown title"), TXT_W), SCR_W / 2, TITLE_Y);
+  String l1, rest;
+  splitLine(np.title.length() ? np.title : String("Unknown title"), TXT_W, l1, rest);
+  tft.drawString(l1, TXT_X, y); y += 22;
+  if (rest.length()) { tft.drawString(fitText(rest, TXT_W), TXT_X, y); y += 22; }
+
+  y += 6;
   tft.setFont(&fonts::FreeSans9pt7b);
   tft.setTextColor(COL_SUB);
-  String sub = np.artist;
-  if (!sub.length()) sub = np.album;
-  if (!sub.length()) sub = np.app;
-  tft.drawString(fitText(sub, TXT_W), SCR_W / 2, ARTIST_Y);
-  tft.setTextDatum(textdatum_t::top_left);
+  if (np.artist.length()) { tft.drawString(fitText(np.artist, TXT_W), TXT_X, y); y += 22; }
+  if (np.album.length())  { tft.drawString(fitText(np.album, TXT_W), TXT_X, y); y += 22; }
+
+  // source app at the bottom of the text column
+  tft.setFont(&fonts::Font2);
+  tft.setTextColor(np.accent);
+  tft.drawString(fitText(np.app, TXT_W), TXT_X, ART_Y + ART_S - 16);
 }
 
 void drawNowPlaying(bool full) {
@@ -428,23 +501,24 @@ unsigned long touchStart = 0;
 bool longPressDone = false;
 unsigned long lastTap = 0;
 
-// Portrait is rotation 0/2 on the original panel and 1/3 on the landscape-native 2-USB panel.
-void applyRotation() {
-  screenRotation = (altPanel ? 1 : 0) + (screenFlipped ? 2 : 0);
-  tft.setRotation(screenRotation);
+// Reads a touch in screen coordinates (accounts for the 180-degree flip).
+bool readTouch(int32_t &x, int32_t &y) {
+  if (!tft.getTouch(&x, &y)) return false;
+  if (screenFlipped) { x = SCR_W - 1 - x; y = SCR_H - 1 - y; }
+  return true;
 }
 
 void flipScreen() {
   screenFlipped = !screenFlipped;
   prefs.putBool("flip", screenFlipped);
-  applyRotation();
+  applyScreenSettings();
   statusShown = "";
   nowPlayingOnScreen = false;   // forces a full redraw
 }
 
 void handleTouch() {
   int32_t x, y;
-  bool touched = tft.getTouch(&x, &y);
+  bool touched = readTouch(x, y);
   if (!touched) { wasTouched = false; longPressDone = false; return; }
 
   if (!wasTouched) {
@@ -468,8 +542,9 @@ void handleTouch() {
     return;
   }
 
-  // Hold the album art (or anywhere above the buttons) for 2 s to flip the screen 180 degrees.
-  if (!longPressDone && y < BTN_Y - 8 && millis() - touchStart > 2000) {
+  // Hold the album art for 2 s to turn the picture upside down.
+  if (!longPressDone && nowPlayingOnScreen && x < ART_X + ART_S && y < ART_Y + ART_S &&
+      millis() - touchStart > 2000) {
     longPressDone = true;
     flipScreen();
   }
@@ -477,22 +552,26 @@ void handleTouch() {
 
 // One-time touch calibration: tap the arrows in each corner.
 void calibrateTouch() {
+  bool wasFlipped = screenFlipped;
+  screenFlipped = false;          // calibrate in the normal orientation
+  applyScreenSettings();
   uint16_t cal[8];
   tft.fillScreen(0x0000);
   tft.setTextDatum(textdatum_t::middle_center);
-  tft.setFont(&fonts::FreeSansBold9pt7b);
+  tft.setFont(&fonts::FreeSansBold12pt7b);
   tft.setTextColor(COL_TEXT);
-  tft.drawString("Touch setup", tft.width() / 2, tft.height() / 2 - 22);
+  tft.drawString("Touch setup", SCR_W / 2, SCR_H / 2 - 18);
   tft.setFont(&fonts::FreeSans9pt7b);
   tft.setTextColor(COL_SUB);
-  tft.drawString("Tap each corner arrow", tft.width() / 2, tft.height() / 2 + 4);
-  tft.drawString("as it appears", tft.width() / 2, tft.height() / 2 + 26);
+  tft.drawString("Tap the arrow in each corner", SCR_W / 2, SCR_H / 2 + 14);
   tft.setTextDatum(textdatum_t::top_left);
   tft.calibrateTouch(cal, 0xFFFFu, 0x0000u, 22);
   tft.setTouchCalibrate(cal);
-  prefs.putBytes("cal2", cal, sizeof(cal));
+  prefs.putBytes("cal3", cal, sizeof(cal));
   int32_t tx, ty;
   while (tft.getTouch(&tx, &ty)) delay(10);   // wait for the finger to lift
+  screenFlipped = wasFlipped;
+  applyScreenSettings();
   statusShown = "";
 }
 
@@ -509,43 +588,50 @@ void showSetupScreen(WiFiManager *) {
   tft.setTextDatum(textdatum_t::top_left);
   tft.setFont(&fonts::FreeSansBold12pt7b);
   tft.setTextColor(0xFFE0);
-  tft.drawString("Wi-Fi setup", 12, 14);
+  tft.drawString("Wi-Fi setup", 16, 12);
   tft.setFont(&fonts::FreeSans9pt7b);
   tft.setTextColor(COL_TEXT);
-  tft.drawString("On your phone, join", 12, 56);
-  tft.drawString("this Wi-Fi network:", 12, 78);
+  tft.drawString("1. On your phone, join the Wi-Fi", 16, 50);
   tft.setFont(&fonts::FreeSansBold12pt7b);
   tft.setTextColor(0x07FF);
-  tft.drawString("DeskCYD-Setup", 12, 104);
+  tft.drawString("DeskCYD-Setup", 36, 74);
   tft.setFont(&fonts::FreeSans9pt7b);
   tft.setTextColor(COL_TEXT);
-  tft.drawString("A setup page opens.", 12, 148);
-  tft.drawString("Tap Configure WiFi,", 12, 170);
-  tft.drawString("pick your network and", 12, 192);
-  tft.drawString("enter its password.", 12, 214);
+  tft.drawString("2. A setup page opens. Tap", 16, 114);
+  tft.drawString("   Configure WiFi, pick your", 16, 136);
+  tft.drawString("   network, enter the password.", 16, 158);
   tft.setTextColor(COL_SUB);
-  tft.drawString("No page? Open", 12, 256);
-  tft.drawString("192.168.4.1 in a browser", 12, 278);
+  tft.drawString("No page? Open 192.168.4.1", 16, 200);
+}
+
+// First 2 seconds after power-on: touch = redo touch setup, BOOT = screen setup,
+// BOOT held 5 s = forget Wi-Fi.
+void bootMenu() {
+  showStatus("Starting...", "Touch: touch setup / BOOT: screen setup");
+  for (int i = 0; i < 20; i++) {
+    int32_t tx, ty;
+    if (tft.getTouch(&tx, &ty)) { calibrateTouch(); return; }
+    if (bootDown()) {
+      showStatus("Release: screen setup", "Keep holding 5 s: forget Wi-Fi");
+      unsigned long t = millis();
+      while (bootDown() && millis() - t < 5000) delay(10);
+      if (millis() - t >= 5000) {
+        showStatus("Forgetting Wi-Fi...", "Release the BOOT button");
+        wm.resetSettings();
+        while (bootDown()) delay(10);
+        delay(1000);
+      } else {
+        runScreenSetup();
+        calibrateTouch();
+      }
+      return;
+    }
+    delay(100);
+  }
 }
 
 void setupWiFi() {
-  // Hold BOOT (GPIO0) during the first 2 seconds to forget the saved network.
-  pinMode(0, INPUT_PULLUP);
-  showStatus("Starting...", "BOOT: reset Wi-Fi / touch: recalibrate");
-  bool reset = false, recal = false;
-  for (int i = 0; i < 20 && !reset && !recal; i++) {
-    int32_t tx, ty;
-    if (digitalRead(0) == LOW) reset = true;
-    if (tft.getTouch(&tx, &ty)) recal = true;
-    delay(100);
-  }
-  if (recal) calibrateTouch();
-  if (reset) {
-    showStatus("Forgetting Wi-Fi...", "Release the BOOT button");
-    wm.resetSettings();
-    delay(1500);
-  }
-  showStatus("Connecting to Wi-Fi", "Hold BOOT at startup to reset");
+  showStatus("Connecting to Wi-Fi", "");
   WiFi.mode(WIFI_STA);
   wm.setAPCallback(showSetupScreen);
   wm.setTitle("DeskCYD");
@@ -561,27 +647,27 @@ void setupWiFi() {
 
 void setup() {
   Serial.begin(115200);
+  pinMode(BOOT_PIN, INPUT_PULLUP);
 
-#if FORCE_PANEL == 1
-  altPanel = false;
-#elif FORCE_PANEL == 2
-  altPanel = true;
-#else
-  altPanel = detectAltPanel();
-#endif
-  Serial.println(altPanel ? "Screen: 2-USB (ILI9342 mode)" : "Screen: original ILI9341");
-  tft.useAltPanel(altPanel);
   tft.init();
+  tft.setRotation(1);       // 320 x 240 drawing area; the real orientation comes from MADCTL
+  tft.setBrightness(200);
 
   prefs.begin("deskcyd", false);
+  bool haveScreen = prefs.isKey("orient") && prefs.isKey("color");
+  orientIdx = prefs.getUChar("orient", 0) % NUM_ORIENT;
+  colorIdx = prefs.getUChar("color", 1) % NUM_COLOR;
   screenFlipped = prefs.getBool("flip", false);
-  applyRotation();
-  tft.setBrightness(200);
+  applyScreenSettings();
   tft.fillScreen(0x0000);
 
+  if (!haveScreen) runScreenSetup();
+
   uint16_t cal[8];
-  if (prefs.getBytes("cal2", cal, sizeof(cal)) == sizeof(cal)) tft.setTouchCalibrate(cal);
+  if (prefs.getBytes("cal3", cal, sizeof(cal)) == sizeof(cal)) tft.setTouchCalibrate(cal);
   else calibrateTouch();
+
+  bootMenu();
 
   if (strlen(PC_IP_MANUAL) > 0) {
     serverIP.fromString(PC_IP_MANUAL);

@@ -16,6 +16,7 @@ concurrency:
 
 env:
   ESP32_URL: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+  FIGTREE_URL: https://raw.githubusercontent.com/google/fonts/main/ofl/figtree/Figtree%5Bwght%5D.ttf
 
 jobs:
   firmware:
@@ -27,7 +28,14 @@ jobs:
         run: |
           arduino-cli core update-index --additional-urls "$ESP32_URL"
           arduino-cli core install esp32:esp32 --additional-urls "$ESP32_URL"
-          arduino-cli lib install "GFX Library for Arduino" XPT2046_Touchscreen ArduinoJson WiFiManager JPEGDEC
+          arduino-cli lib install "GFX Library for Arduino" XPT2046_Touchscreen ArduinoJson WiFiManager
+      - name: Generate fonts and set version
+        run: |
+          pip install pillow
+          curl -sSL -o Figtree.ttf "$FIGTREE_URL"
+          python tools/make_fonts.py Figtree.ttf firmware/DeskCYD/fonts.h
+          sed -i "s/^#define FW_VERSION 0$/#define FW_VERSION ${GITHUB_RUN_NUMBER}/" firmware/DeskCYD/DeskCYD.ino
+          grep -n "define FW_VERSION" firmware/DeskCYD/DeskCYD.ino
       - name: Compile
         run: |
           arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs \
@@ -47,10 +55,13 @@ jobs:
               0xe000 "$BOOT_APP0" \
               0x10000 build/DeskCYD.ino.bin
           fi
+          cp build/DeskCYD.ino.bin DeskCYD-app.bin
       - uses: actions/upload-artifact@v4
         with:
           name: firmware
-          path: DeskCYD.bin
+          path: |
+            DeskCYD.bin
+            DeskCYD-app.bin
 
   pc-app:
     runs-on: windows-latest
@@ -61,8 +72,14 @@ jobs:
           python-version: "3.12"
       - name: Install packages
         run: pip install winsdk pillow pystray pyinstaller
+      - name: Font and version
+        shell: bash
+        run: |
+          curl -sSL -o pc/Figtree.ttf "$FIGTREE_URL"
+          sed -i "s/^APP_VERSION = 0 /APP_VERSION = ${GITHUB_RUN_NUMBER} /" pc/deskcyd.py
+          grep -n "^APP_VERSION" pc/deskcyd.py
       - name: Build DeskCYD.exe
-        run: pyinstaller --onefile --noconsole --name DeskCYD --hidden-import pystray._win32 pc/deskcyd.py
+        run: pyinstaller --onefile --noconsole --name DeskCYD --hidden-import pystray._win32 --add-data "pc/Figtree.ttf;." pc/deskcyd.py
       - uses: actions/upload-artifact@v4
         with:
           name: pc-app
@@ -80,8 +97,16 @@ jobs:
         run: |
           mkdir site
           cp web/* site/
-          cp dl/firmware/DeskCYD.bin site/
+          cp dl/firmware/DeskCYD.bin dl/firmware/DeskCYD-app.bin site/
           cp dl/pc-app/DeskCYD.exe site/
+          echo "{\"version\": ${GITHUB_RUN_NUMBER}}" > site/version.json
+          # keep the last known-good simple version (v9) available as a fallback
+          LIVE=https://proxyproto66-boop.github.io/deskcyd
+          if curl -sfL -o site/DeskCYD-fallback.bin "$LIVE/DeskCYD-fallback.bin"; then
+            echo "kept existing fallback"
+          else
+            curl -sfL -o site/DeskCYD-fallback.bin "$LIVE/DeskCYD.bin" && echo "saved current live build as fallback"
+          fi
           sed -i "s/__VERSION__/${GITHUB_RUN_NUMBER}/g" site/manifest.json site/index.html
           ls -la site
       - uses: actions/upload-pages-artifact@v4

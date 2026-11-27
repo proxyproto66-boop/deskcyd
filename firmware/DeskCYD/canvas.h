@@ -3,6 +3,7 @@
 #pragma once
 #include <Arduino.h>
 #include <math.h>
+#include <string.h>
 #include "fonts.h"
 
 static inline uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
@@ -49,17 +50,21 @@ struct Canvas {
     *p = (a >= 250) ? c : mix565(*p, c, a);
   }
 
-  void fillRect(int x, int y, int W, int H, uint16_t c) {
+  void fillRect(int x, int y, int W, int H, uint16_t c, uint8_t alpha = 255) {
     int x0 = x, y0 = y, x1 = x + W, y1 = y + H;
     if (!clip(x0, y0, x1, y1)) return;
     for (int yy = y0; yy < y1; yy++) {
       uint16_t *p = at(x0, yy);
-      for (int xx = x0; xx < x1; xx++) *p++ = c;
+      if (alpha >= 250) for (int xx = x0; xx < x1; xx++) *p++ = c;
+      else for (int xx = x0; xx < x1; xx++, p++) *p = mix565(*p, c, alpha);
     }
+  }
+  static inline uint8_t mulA(float cov, uint8_t alpha) {
+    return cov >= 1 ? alpha : (uint8_t)(cov * alpha);
   }
 
   // anti-aliased filled circle
-  void fillCircle(float cx, float cy, float r, uint16_t c) {
+  void fillCircle(float cx, float cy, float r, uint16_t c, uint8_t alpha = 255) {
     int x0 = (int)floorf(cx - r - 1), y0 = (int)floorf(cy - r - 1);
     int x1 = (int)ceilf(cx + r + 1), y1 = (int)ceilf(cy + r + 1);
     if (!clip(x0, y0, x1, y1)) return;
@@ -69,7 +74,28 @@ struct Canvas {
         float dx = x + 0.5f - cx;
         float d = r - sqrtf(dx * dx + dy * dy) + 0.5f;
         if (d <= 0) continue;
-        blendPx(x, y, c, d >= 1 ? 255 : (uint8_t)(d * 255));
+        blendPx(x, y, c, mulA(d, alpha));
+      }
+    }
+  }
+
+  // circle (cx,cy,r) with the circle (kx,ky,kr) cut out of it - used for the moon
+  void fillCircleCut(float cx, float cy, float r, float kx, float ky, float kr, uint16_t c) {
+    int x0 = (int)floorf(cx - r - 1), y0 = (int)floorf(cy - r - 1);
+    int x1 = (int)ceilf(cx + r + 1), y1 = (int)ceilf(cy + r + 1);
+    if (!clip(x0, y0, x1, y1)) return;
+    for (int y = y0; y < y1; y++) {
+      for (int x = x0; x < x1; x++) {
+        float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
+        float a = r - sqrtf(dx * dx + dy * dy) + 0.5f;
+        if (a <= 0) continue;
+        if (a > 1) a = 1;
+        float ex = x + 0.5f - kx, ey = y + 0.5f - ky;
+        float b = kr - sqrtf(ex * ex + ey * ey) + 0.5f;
+        if (b < 0) b = 0;
+        if (b > 1) b = 1;
+        a *= (1 - b);
+        if (a > 0) blendPx(x, y, c, (uint8_t)(a * 255));
       }
     }
   }
@@ -93,7 +119,7 @@ struct Canvas {
   }
 
   // anti-aliased rounded rectangle
-  void fillRoundRect(int x, int y, int W, int H, float r, uint16_t c) {
+  void fillRoundRect(int x, int y, int W, int H, float r, uint16_t c, uint8_t alpha = 255) {
     int x0 = x, y0 = y, x1 = x + W, y1 = y + H;
     if (!clip(x0, y0, x1, y1)) return;
     if (r > W / 2.0f) r = W / 2.0f;
@@ -105,10 +131,14 @@ struct Canvas {
         float px = xx + 0.5f;
         float cx = px < x + r ? x + r : (px > x + W - r ? x + W - r : px);
         float dx = px - cx, dy = py - cy;
-        if (dx == 0 && dy == 0) { *at(xx, yy) = c; continue; }
+        if (dx == 0 && dy == 0) {
+          uint16_t *p = at(xx, yy);
+          *p = alpha >= 250 ? c : mix565(*p, c, alpha);
+          continue;
+        }
         float d = r - sqrtf(dx * dx + dy * dy) + 0.5f;
         if (d <= 0) continue;
-        blendPx(xx, yy, c, d >= 1 ? 255 : (uint8_t)(d * 255));
+        blendPx(xx, yy, c, mulA(d, alpha));
       }
     }
   }
@@ -218,6 +248,22 @@ struct Canvas {
       x += g.adv;
     }
     return x - start;
+  }
+  // text cut to maxW pixels with "..." when it doesn't fit
+  int textFit(int x, int y, const char *s, const AAFont &f, uint16_t c, int maxW) {
+    if (textWidth(s, f) <= maxW) return text(x, y, s, f, c);
+    char tmp[64];
+    int n = strlen(s);
+    if (n > 60) n = 60;
+    int dots = textWidth("...", f);
+    while (n > 0) {
+      memcpy(tmp, s, n);
+      tmp[n] = 0;
+      if (textWidth(tmp, f) + dots <= maxW) break;
+      n--;
+    }
+    strcpy(tmp + n, "...");
+    return text(x, y, tmp, f, c);
   }
   int textCentered(int cx, int y, const char *s, const AAFont &f, uint16_t c) {
     int w = textWidth(s, f);

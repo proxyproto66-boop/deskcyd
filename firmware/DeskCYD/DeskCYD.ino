@@ -3,14 +3,15 @@
   For the ESP32-2432S028 "Cheap Yellow Display" (all versions).
 
   First start:
-    1. Screen setup  - press BOOT to step through options until the screen looks right,
-                       then HOLD BOOT for 2 seconds to save. Then pick colors the same way.
-    2. Touch setup   - tap the arrow in each corner.
-    3. Wi-Fi setup   - join the "DeskCYD-Setup" network from your phone.
+    1. Touch setup   - tap the arrow in each corner.
+    2. Wi-Fi setup   - join the "DeskCYD-Setup" network from your phone.
+  The screen type (original CYD or the USB-C / 2-USB version) is detected automatically.
+  If the picture still looks wrong, use the screen setup below.
 
   During "Starting..." (first 2 seconds after power-on):
     - touch the screen          -> redo touch setup
-    - press BOOT briefly        -> redo screen setup
+    - press BOOT briefly        -> screen setup (press BOOT to step through options,
+                                   HOLD BOOT 2 s to save)
     - hold BOOT for 5 seconds   -> forget Wi-Fi
 
   Hold the album art for 2 seconds to turn the picture upside down.
@@ -131,6 +132,84 @@ void applyScreenSettings() {
   tft.writeCommand(0x36);                   // MADCTL
   tft.writeData(mad);
   tft.writeCommand((colorIdx & 2) ? 0x21 : 0x20);   // inversion on / off
+  tft.endWrite();
+}
+
+// ---------------- 2-USB / USB-C CYD support ----------------
+bool altPanel = false;   // true on USB-C / 2-USB CYDs
+
+// Ask the screen chip for its ID before starting the display driver.
+// The 2-USB panels answer 0x85 0x85 0x52; the original ILI9341 answers zeros to this command.
+bool detectAltPanel() {
+  pinMode(15, OUTPUT);
+  digitalWrite(15, HIGH);
+  pinMode(2, OUTPUT);
+  SPIClass probe(HSPI);
+  probe.begin(14, 12, 13, -1);
+  probe.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(15, LOW);
+  digitalWrite(2, LOW);
+  probe.transfer(0x04);   // RDDID
+  digitalWrite(2, HIGH);
+  uint32_t raw = probe.transfer32(0);
+  digitalWrite(15, HIGH);
+  probe.endTransaction();
+  probe.end();
+  Serial.printf("Panel ID read: 0x%08X\n", raw);
+  for (int sh = 0; sh <= 16; sh++) {
+    if (((raw >> sh) & 0xFFFF) == 0x8585) return true;
+  }
+  return false;
+}
+
+// The 2-USB CYD needs a different start-up sequence (the "ILI9341_2" sequence that
+// TFT_eSPI uses for this board). Sent after the normal driver init.
+void sendCmd(uint8_t c, const uint8_t *d, int n) {
+  tft.writeCommand(c);
+  for (int i = 0; i < n; i++) tft.writeData(d[i]);
+}
+
+void initAltPanel() {
+  static const uint8_t cf[] = {0x00, 0xC1, 0x30};
+  static const uint8_t ed[] = {0x64, 0x03, 0x12, 0x81};
+  static const uint8_t e8[] = {0x85, 0x00, 0x78};
+  static const uint8_t cb[] = {0x39, 0x2C, 0x00, 0x34, 0x02};
+  static const uint8_t f7[] = {0x20};
+  static const uint8_t ea[] = {0x00, 0x00};
+  static const uint8_t c0[] = {0x10};
+  static const uint8_t c1[] = {0x00};
+  static const uint8_t c5[] = {0x30, 0x30};
+  static const uint8_t c7[] = {0xB7};
+  static const uint8_t px[] = {0x55};
+  static const uint8_t b1[] = {0x00, 0x1A};
+  static const uint8_t b6[] = {0x08, 0x82, 0x27};
+  static const uint8_t f2[] = {0x00};
+  static const uint8_t g26[] = {0x01};
+  static const uint8_t e0[] = {0x0F, 0x2A, 0x28, 0x08, 0x0E, 0x08, 0x54, 0xA9, 0x43, 0x0A, 0x0F, 0x00, 0x00, 0x00, 0x00};
+  static const uint8_t e1[] = {0x00, 0x15, 0x17, 0x07, 0x11, 0x06, 0x2B, 0x56, 0x3C, 0x05, 0x10, 0x0F, 0x3F, 0x3F, 0x0F};
+  tft.startWrite();
+  sendCmd(0xCF, cf, sizeof(cf));
+  sendCmd(0xED, ed, sizeof(ed));
+  sendCmd(0xE8, e8, sizeof(e8));
+  sendCmd(0xCB, cb, sizeof(cb));
+  sendCmd(0xF7, f7, sizeof(f7));
+  sendCmd(0xEA, ea, sizeof(ea));
+  sendCmd(0xC0, c0, sizeof(c0));
+  sendCmd(0xC1, c1, sizeof(c1));
+  sendCmd(0xC5, c5, sizeof(c5));
+  sendCmd(0xC7, c7, sizeof(c7));
+  sendCmd(0x3A, px, sizeof(px));
+  sendCmd(0xB1, b1, sizeof(b1));
+  sendCmd(0xB6, b6, sizeof(b6));
+  sendCmd(0xF2, f2, sizeof(f2));
+  sendCmd(0x26, g26, sizeof(g26));
+  sendCmd(0xE0, e0, sizeof(e0));
+  sendCmd(0xE1, e1, sizeof(e1));
+  tft.writeCommand(0x11);   // sleep out
+  tft.endWrite();
+  delay(120);
+  tft.startWrite();
+  tft.writeCommand(0x29);   // display on
   tft.endWrite();
 }
 
@@ -649,19 +728,21 @@ void setup() {
   Serial.begin(115200);
   pinMode(BOOT_PIN, INPUT_PULLUP);
 
+  altPanel = detectAltPanel();
+  Serial.println(altPanel ? "Screen: 2-USB / USB-C CYD" : "Screen: original CYD");
+
   tft.init();
+  if (altPanel) initAltPanel();
   tft.setRotation(1);       // 320 x 240 drawing area; the real orientation comes from MADCTL
   tft.setBrightness(200);
 
-  prefs.begin("deskcyd", false);
-  bool haveScreen = prefs.isKey("orient") && prefs.isKey("color");
-  orientIdx = prefs.getUChar("orient", 0) % NUM_ORIENT;
-  colorIdx = prefs.getUChar("color", 1) % NUM_COLOR;
+  // Settings are saved per screen type, so swapping boards starts from good defaults.
+  prefs.begin(altPanel ? "deskcyd2" : "deskcyd1", false);
+  orientIdx = prefs.getUChar("orient", 0) % NUM_ORIENT;            // 0x20 = landscape
+  colorIdx = prefs.getUChar("color", altPanel ? 3 : 1) % NUM_COLOR; // 2-USB: BGR + inverted
   screenFlipped = prefs.getBool("flip", false);
   applyScreenSettings();
   tft.fillScreen(0x0000);
-
-  if (!haveScreen) runScreenSetup();
 
   uint16_t cal[8];
   if (prefs.getBytes("cal3", cal, sizeof(cal)) == sizeof(cal)) tft.setTouchCalibrate(cal);

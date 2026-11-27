@@ -17,7 +17,7 @@ SPECS = [
     ("F_BODYB", 15, 700, 32, 126),
     ("F_TITLE", 20, 700, 32, 126),
     ("F_LARGE", 30, 600, 32, 126),
-    ("F_HUGE", 72, 300, 48, 58),   # digits and ':' for the clock
+    ("F_TEMP", 42, 300, 45, 58),   # '-', '.', '/', digits, ':' for the big temperature
 ]
 
 

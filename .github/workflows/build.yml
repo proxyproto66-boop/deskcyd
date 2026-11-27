@@ -68,12 +68,9 @@ jobs:
           name: pc-app
           path: dist/DeskCYD.exe
 
-  publish:
+  site:
     needs: [firmware, pc-app]
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -86,8 +83,17 @@ jobs:
           cp dl/firmware/DeskCYD.bin site/
           cp dl/pc-app/DeskCYD.exe site/
           sed -i "s/__VERSION__/${GITHUB_RUN_NUMBER}/g" site/manifest.json site/index.html
-      - uses: actions/upload-pages-artifact@v3
+          ls -la site
+      - uses: actions/upload-pages-artifact@v4
         with:
           path: site
+
+  deploy:
+    needs: site
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
       - id: deploy
         uses: actions/deploy-pages@v4

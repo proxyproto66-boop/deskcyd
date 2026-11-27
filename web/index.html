@@ -53,7 +53,16 @@
     </ol>
   </div>
 
-  <p class="note">Play something on your PC and it shows up on the CYD. Your PC and the CYD need to be on the same Wi-Fi.</p>
+  <p class="note">Play something on your PC and it shows up on the CYD. Your PC and the CYD need to be on the same Wi-Fi.
+  After this first install, updates arrive over Wi-Fi: the CYD shows an "Update" button when a new version is ready.</p>
+
+  <div class="step">
+    <h2>Something not working?</h2>
+    <p class="note">Install the earlier simple version (v9) instead. It only has the basic Now Playing screen.</p>
+    <esp-web-install-button manifest="manifest-fallback.json">
+      <button slot="activate" class="btn" style="background:#3a3a3c;color:#fff">Install simple version</button>
+    </esp-web-install-button>
+  </div>
 </main>
 </body>
 </html>

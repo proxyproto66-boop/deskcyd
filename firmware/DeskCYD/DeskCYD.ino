@@ -4,13 +4,15 @@
   Screen + touch setup copied from cyd_scribble.ino (known to work on this board):
     Arduino_GFX ILI9341 on HSPI, rotation 1, XPT2046 touch on VSPI with fixed calibration.
 
-  Pages (swipe left/right starting in the top strip, where the page dots are):
-    0 Now Playing (Spotify style)   1 Clock   2 Device / settings
+  Pages (swipe left/right starting in the top half-inch of the screen):
+    0 Now Playing (Spotify style)   1 USA day/night map + weather   2 Settings
+  Map page: drag sideways to move time (the sun follows your finger), tap for the weather.
   First start: join the "DeskCYD-Setup" Wi-Fi from your phone.
   Hold BOOT for 5 seconds while it says "Starting..." to forget the saved Wi-Fi.
   Hold the album art for 2 seconds to turn the picture upside down.
 
-  Built by GitHub Actions; fonts.h is generated there from the Figtree font.
+  Built by GitHub Actions; fonts.h (Figtree font) and mapdata.h (NASA satellite pictures)
+  are generated there.
   Libraries: GFX Library for Arduino, XPT2046_Touchscreen, ArduinoJson (v7), WiFiManager
 */
 
@@ -75,7 +77,15 @@ struct NetFlags {
   char tid[16] = "", aid[16] = "";
   char plIds[24][40];
   bool toastNew = false;
+  uint32_t wxNextAt = 0;    // when to fetch the weather next (0 = as soon as possible)
+  bool wxNow = false;       // location changed: fetch now
+  bool tzSaved = false;
 } nf;
+
+// location picker: one query per level ("", "r=NA", "r=NA&c=US", "r=NA&c=US&s=MA")
+char locQuery[4][48];
+#define LOC_BUF_SIZE 24576
+#define LOC_MAX_ITEMS 1000
 
 uint32_t playOverrideUntil = 0, posOverrideUntil = 0, likeOverrideUntil = 0;
 
@@ -163,12 +173,20 @@ void drawRegion(int x, int y, int w, int h) {
 
 void drawAll() { drawRegion(0, 0, SCR_W, SCR_H); }
 
+float wxTarget = 0;          // weather panel: 0 closed, 1 open
+void resetMapPage() {
+  ui.mapOffMin = 0;
+  ui.wxPos = 0;
+  wxTarget = 0;
+}
+
 // Slide to another page using the screen's hardware scrolling (call with mtx held).
 // dir = +1: the new page comes in from the right; -1: from the left.
 void slideTo(int newPage, int dir) {
   if (newPage == ui.page) return;
   ui.plOpen = false;
-  if (!ui.anim || ui.status[0] || ui.otaProgress >= 0) {
+  if (ui.page == 1) resetMapPage();
+  if (!ui.anim || ui.otaProgress >= 0) {
     ui.page = newPage;
     drawAll();
     return;
@@ -347,12 +365,13 @@ void pollPC() {
   nf.epoch = doc["epoch"] | 0L;
   nf.tzoff = doc["tz"] | 0L;
   nf.epochAt = now;
+  if (nf.tzoff != ui.tzoff) { ui.tzoff = nf.tzoff; nf.tzSaved = false; }
   int appVer = doc["app"] | 0, fwl = doc["fwl"] | 0;
   bool fwr = doc["fwr"] | false;
   if (appVer != ui.appVer || fwl != ui.fwLatest || fwr != ui.fwReady) {
     ui.appVer = appVer; ui.fwLatest = fwl; ui.fwReady = fwr;
     nf.top = true;
-    if (ui.page == 2) nf.full = true;
+    if (ui.page != 0) nf.full = true;
   }
   needText = strcmp(tid, nf.tid) != 0;
   needArt = strcmp(aid, nf.aid) != 0;
@@ -377,6 +396,105 @@ String httpGet(const String &path, int *code) {
     http.end();
   }
   return body;
+}
+
+// ---------- weather ----------
+String urlEncode(const char *v) {
+  String o;
+  for (; *v; v++) {
+    char ch = *v;
+    if (isalnum((unsigned char)ch) || ch == '-' || ch == '.' || ch == '_') o += ch;
+    else { char b[4]; sprintf(b, "%%%02X", (uint8_t)ch); o += b; }
+  }
+  return o;
+}
+
+bool fetchWeather() {
+  String path;
+  LOCK();
+  if (ui.locNear) path = "/api/weather?near=1";
+  else path = "/api/weather?lat=" + String(ui.locLat, 4) + "&lon=" + String(ui.locLon, 4) + "&name=" + urlEncode(ui.locName);
+  UNLOCK();
+  HTTPClient http;
+  http.setConnectTimeout(1500);
+  http.setTimeout(12000);   // the PC may have to ask the weather service first
+  bool ok = false;
+  String body;
+  if (http.begin(baseUrl() + path)) {
+    if (http.GET() == 200) { body = http.getString(); ok = true; }
+    http.end();
+  }
+  JsonDocument d;
+  if (!ok || deserializeJson(d, body) || !(d["ok"] | false)) return false;
+  LOCK();
+  Weather &w = ui.wx;
+  w.valid = true;
+  strncpy(w.city, d["city"] | "", sizeof(w.city) - 1);
+  w.city[sizeof(w.city) - 1] = 0;
+  w.lat = d["lat"] | 0.0f;
+  w.lon = d["lon"] | 0.0f;
+  w.t = d["t"] | 0.0f;
+  w.hi = d["hi"] | 0.0f;
+  w.lo = d["lo"] | 0.0f;
+  w.code = d["code"] | 0;
+  w.day = (d["day"] | 1) != 0;
+  w.nh = 0;
+  for (JsonArray h : d["h"].as<JsonArray>()) {
+    if (w.nh >= 4) break;
+    w.h[w.nh].hour = h[0] | 0;
+    w.h[w.nh].code = h[1] | 0;
+    w.h[w.nh].day = (h[2] | 1) != 0;
+    w.h[w.nh].t = h[3] | 0.0f;
+    w.nh++;
+  }
+  if (ui.page == 1) nf.full = true;
+  UNLOCK();
+  return true;
+}
+
+// ---------- location picker lists ----------
+// Reply: first line "<type>\t<title>", then one item per line.
+void fetchLocList(const char *query) {
+  HTTPClient http;
+  http.setConnectTimeout(1500);
+  http.setTimeout(6000);
+  bool ok = false;
+  int len = 0;
+  if (http.begin(baseUrl() + "/api/loc?" + query) && http.GET() == 200) {
+    len = http.getSize();
+    if (len > 0 && len < LOC_BUF_SIZE) {
+      // the picker shows "Loading..." and doesn't touch the buffer until we're done
+      ok = readExact(http.getStreamPtr(), (uint8_t *)ui.locBuf, len, 8000);
+    }
+  }
+  http.end();
+  LOCK();
+  ui.locCount = 0;
+  ui.locScroll = 0;
+  if (ok) {
+    ui.locBuf[len] = 0;
+    char *nl = strchr(ui.locBuf, '\n');
+    if (nl) {
+      ui.locType = ui.locBuf[0];
+      char *tab = strchr(ui.locBuf, '\t');
+      int tl = (tab && tab < nl) ? (int)(nl - tab - 1) : 0;
+      if (tl > (int)sizeof(ui.locTitle) - 1) tl = sizeof(ui.locTitle) - 1;
+      memcpy(ui.locTitle, tab + 1, tl);
+      ui.locTitle[tl] = 0;
+      char *p = nl + 1;
+      while (*p && ui.locCount < LOC_MAX_ITEMS) {
+        ui.locOff[ui.locCount++] = (uint16_t)(p - ui.locBuf);
+        char *e = strchr(p, '\n');
+        if (!e) break;
+        p = e + 1;
+      }
+    }
+  } else {
+    showToast("Couldn't load the list");
+  }
+  ui.locLoading = false;
+  nf.full = true;
+  UNLOCK();
 }
 
 void doOta() {
@@ -463,6 +581,8 @@ void runCmd(const char *cmd) {
     UNLOCK();
   } else if (strcmp(cmd, "ota") == 0) {
     doOta();
+  } else if (strncmp(cmd, "loc:", 4) == 0) {
+    fetchLocList(cmd + 4);
   }
 }
 
@@ -477,6 +597,11 @@ void netTask(void *) {
     if (millis() - lastPoll >= 400) {
       lastPoll = millis();
       pollPC();
+    }
+    if (nf.pcOk && (nf.wxNow || (int32_t)(millis() - nf.wxNextAt) >= 0)) {
+      nf.wxNow = false;
+      bool ok = fetchWeather();
+      nf.wxNextAt = millis() + (ok ? 10 * 60000UL : 60000UL);   // every 10 min, retry after 1 min
     }
     vTaskDelay(pdMS_TO_TICKS(15));
   }
@@ -495,7 +620,7 @@ bool readTouch(int &x, int &y) {
   return true;
 }
 
-enum TouchKind { T_NONE, T_TOP, T_SCRUB, T_BUTTON, T_LIST, T_ART, T_DEVICE };
+enum TouchKind { T_NONE, T_TOP, T_SCRUB, T_BUTTON, T_LIST, T_ART, T_MAP, T_SET, T_LOCLIST, T_LOCINDEX };
 struct TouchState {
   bool down = false;
   uint32_t lastSeen = 0, t0 = 0;
@@ -505,9 +630,17 @@ struct TouchState {
   int listScroll0 = 0;
   bool longDone = false;
   bool swipeOk = false;   // touch started in the swipe zone
+  float mapOff0 = 0;
+  bool dragging = false;  // map time drag / settings scroll in progress
 } tch;
 
-#define SWIPE_H 72   // swipe zone: top ~0.5 inch of the screen (2.8" panel is ~143 px per inch)
+// map time drag: the sun follows the finger (4 minutes of time per degree of longitude)
+const float MAP_MIN_PER_PX = 4.0f / MAP_PX_PER_DEG_LON;
+const float MAP_MAX_OFF_MIN = 12 * 60;
+bool mapDirty = false;
+uint32_t glideAt = 0, glideT0 = 0, wxOpenedAt = 0;
+bool gliding = false;
+float glideFrom = 0;
 
 void applyRotation() {
   gfx->setRotation(ui.flipped ? 3 : 1);
@@ -524,11 +657,144 @@ void redrawBar() { drawRegion(0, BAR_Y - 10, SCR_W, 32); }
 void redrawControls() { drawRegion(0, CTRL_CY - 22, SCR_W, SCR_H - (CTRL_CY - 22)); }
 void redrawIcons() { drawRegion(TX - 8, ICON_CY - 16, SCR_W - TX + 8, 34); }
 
+void toggleWeather() {
+  wxTarget = wxTarget > 0.5f ? 0 : 1;
+  wxOpenedAt = millis();
+}
+
+// ---------- location picker ----------
+void locRequest(int level) {
+  ui.locLevel = level;
+  ui.locLoading = true;
+  ui.locCount = 0;
+  char c[56];
+  snprintf(c, sizeof(c), "loc:%s", locQuery[level]);
+  queueCmd(c);
+  drawAll();
+}
+
+void openLocPicker() {
+  if (!nf.pcOk) { showToast("Needs the PC app running"); return; }
+  if (!ui.locBuf) {
+    ui.locBuf = (char *)malloc(LOC_BUF_SIZE);
+    ui.locOff = (uint16_t *)malloc(LOC_MAX_ITEMS * sizeof(uint16_t));
+    if (!ui.locBuf || !ui.locOff) {
+      free(ui.locBuf); free(ui.locOff);
+      ui.locBuf = nullptr; ui.locOff = nullptr;
+      showToast("Not enough memory");
+      return;
+    }
+  }
+  ui.locOpen = true;
+  strcpy(ui.locTitle, "Location");
+  locQuery[0][0] = 0;
+  locRequest(0);
+}
+
+void closeLocPicker() {
+  ui.locOpen = false;
+  drawAll();
+}
+
+void locPick(int idx) {
+  if (idx < 0 || idx >= ui.locCount || ui.locLoading) return;
+  char name[40];
+  const char *rest = locItem(ui, idx, name, sizeof(name));
+  if (rest[0] == '*') {                       // Near my PC
+    ui.locNear = true;
+    prefs.putBool("lnear", true);
+  } else if (ui.locType == 'Y') {             // a city: "name\tlat\tlon"
+    float lat = atof(rest);
+    const char *t2 = strchr(rest, '\t');
+    float lon = t2 ? atof(t2 + 1) : 0;
+    ui.locNear = false;
+    strncpy(ui.locName, name, sizeof(ui.locName) - 1);
+    ui.locName[sizeof(ui.locName) - 1] = 0;
+    ui.locLat = lat; ui.locLon = lon;
+    prefs.putBool("lnear", false);
+    prefs.putString("lname", ui.locName);
+    prefs.putFloat("llat", lat);
+    prefs.putFloat("llon", lon);
+  } else {                                    // region / country / state: go one level down
+    if (ui.locLevel >= 3) return;
+    char id[12];
+    int n = 0;
+    while (rest[n] && rest[n] != '\t' && rest[n] != '\n' && n < 11) { id[n] = rest[n]; n++; }
+    id[n] = 0;
+    const char *key = ui.locType == 'R' ? "r" : ui.locType == 'C' ? "c" : "s";
+    int L = ui.locLevel;
+    snprintf(locQuery[L + 1], sizeof(locQuery[0]), "%s%s%s=%s", locQuery[L], locQuery[L][0] ? "&" : "", key, id);
+    locRequest(L + 1);
+    return;
+  }
+  ui.wx.valid = false;
+  nf.wxNow = true;
+  char msg[48];
+  snprintf(msg, sizeof(msg), "Location: %s", ui.locNear ? "Near my PC" : ui.locName);
+  showToast(msg);
+  closeLocPicker();
+}
+
+void locJumpToLetter(int y) {
+  int i = (int)((y - PL_TOP) * 26 / (SCR_H - PL_TOP - 8));
+  if (i < 0) i = 0;
+  if (i > 25) i = 25;
+  char letter = 'A' + i;
+  char name[40];
+  int target = ui.locCount - 1;
+  for (int k = 0; k < ui.locCount; k++) {
+    locItem(ui, k, name, sizeof(name));
+    if (toupper((unsigned char)name[0]) >= letter) { target = k; break; }
+  }
+  int maxScroll = max(0, ui.locCount - PL_ROWS);
+  target = constrain(target, 0, maxScroll);
+  if (target != ui.locScroll) { ui.locScroll = target; drawAll(); }
+}
+
+// ---------- settings ----------
+void applyBacklight(int level) {
+  ledcWrite(GFX_BL, level);
+}
+
+void settingsTap(int x, int y) {
+  int row = setRowAt(y + ui.setScroll);
+  switch (row) {
+    case SR_LOCATION: openLocPicker(); return;
+    case SR_UNITS: ui.unitC = !ui.unitC; prefs.putBool("unitC", ui.unitC); break;
+    case SR_24H: ui.h24 = !ui.h24; prefs.putBool("h24", ui.h24); break;
+    case SR_LANG: showToast("More languages coming later"); break;
+    case SR_INVERT: ui.invert = !ui.invert; prefs.putBool("inv", ui.invert); gfx->invertDisplay(ui.invert); break;
+    case SR_ANIM: ui.anim = !ui.anim; prefs.putBool("anim", ui.anim); break;
+    case SR_FLIP: ui.flipped = !ui.flipped; prefs.putBool("flip", ui.flipped); applyRotation(); break;
+    case SR_ABRI:
+      ui.autoBri = !ui.autoBri;
+      prefs.putBool("abri", ui.autoBri);
+      if (!ui.autoBri) applyBacklight(255);
+      break;
+    case SR_FIRMWARE:
+      if (updateAvailable(ui) && ui.otaProgress < 0) { queueCmd("ota"); return; }
+      break;
+    default: return;
+  }
+  drawAll();
+}
+
+// ---------- touch handling ----------
 void onTouchDown(int x, int y) {
   tch.kind = T_NONE;
   tch.swipeOk = false;
-  if (ui.status[0] || ui.otaProgress >= 0) return;
+  tch.dragging = false;
+  if (ui.otaProgress >= 0) return;
 
+  if (ui.locOpen) {
+    if (x > 266 && y < 56) { closeLocPicker(); return; }
+    if (x < 70 && y < 56 && ui.locLevel > 0 && !ui.locLoading) { locRequest(ui.locLevel - 1); return; }
+    if (y >= PL_TOP && !ui.locLoading) {
+      if (ui.locCount > LIST_INDEX_MIN && x >= LIST_INDEX_X - 6) { tch.kind = T_LOCINDEX; locJumpToLetter(y); }
+      else { tch.kind = T_LOCLIST; tch.listScroll0 = ui.locScroll; }
+    }
+    return;
+  }
   if (ui.plOpen) {
     if (x > 266 && y < 56) { ui.plOpen = false; drawAll(); return; }
     if (y >= PL_TOP) { tch.kind = T_LIST; tch.listScroll0 = ui.plScroll; }
@@ -536,9 +802,26 @@ void onTouchDown(int x, int y) {
   }
   // A sideways drag that starts in this zone changes page; a tap still goes to whatever is under the finger.
   tch.swipeOk = y < SWIPE_H;
-  if (y < TOP_H + 6) { tch.kind = T_TOP; return; }
 
-  if (ui.page == 0 && ui.active) {
+  if (ui.page == 1) {
+    wxOpenedAt = millis();          // touching the map keeps the weather panel open
+    gliding = false;
+    glideAt = 0;
+    if (y < SWIPE_H) { tch.kind = T_TOP; return; }
+    tch.kind = T_MAP;
+    tch.mapOff0 = ui.mapOffMin;
+    return;
+  }
+  if (ui.page == 2) {
+    tch.kind = (y < TOP_H + 6) ? T_TOP : T_SET;
+    tch.listScroll0 = ui.setScroll;
+    return;
+  }
+
+  // page 0
+  if (y < TOP_H + 6) { tch.kind = T_TOP; return; }
+  if (ui.status[0]) return;
+  if (ui.active) {
     if (y >= BAR_Y - 14 && y <= BAR_Y + 16 && ui.durMs > 0) {
       tch.kind = T_SCRUB;
       ui.scrubbing = true;
@@ -584,14 +867,12 @@ void onTouchDown(int x, int y) {
     }
     if (x < ART_X + ART_S && y < ART_Y + ART_S) { tch.kind = T_ART; return; }
   }
-
-  if (ui.page == 2) { tch.kind = T_DEVICE; return; }
 }
 
 void onTouchMove(int x, int y) {
   int dx = x - tch.x0, dy = y - tch.y0;
   if (abs(dx) > 8 || abs(dy) > 8) tch.moved = true;
-  if (tch.swipeOk && tch.kind != T_SCRUB && tch.kind != T_LIST && abs(dx) > 40 && abs(dx) > abs(dy)) {
+  if (tch.swipeOk && tch.kind != T_SCRUB && abs(dx) > 40 && abs(dx) > abs(dy)) {
     int dir = dx < 0 ? 1 : -1;   // finger moves left -> next page
     int np = (ui.page + dir + NUM_PAGES) % NUM_PAGES;
     tch.swipeOk = false;
@@ -611,6 +892,32 @@ void onTouchMove(int x, int y) {
       if (s != ui.plScroll) { ui.plScroll = s; drawAll(); }
       break;
     }
+    case T_LOCLIST: {
+      int maxScroll = max(0, ui.locCount - PL_ROWS);
+      int s = tch.listScroll0 - dy / (PL_ROW_H / 2);   // half-row steps: long lists scroll faster
+      s = constrain(s, 0, maxScroll);
+      if (s != ui.locScroll) { ui.locScroll = s; drawAll(); }
+      break;
+    }
+    case T_LOCINDEX:
+      locJumpToLetter(y);
+      break;
+    case T_MAP:
+      if (tch.dragging || abs(dx) > 6) {
+        tch.dragging = true;
+        float off = tch.mapOff0 - dx * MAP_MIN_PER_PX;   // drag left = later
+        if (off > MAP_MAX_OFF_MIN) off = MAP_MAX_OFF_MIN;
+        if (off < -MAP_MAX_OFF_MIN) off = -MAP_MAX_OFF_MIN;
+        if (off != ui.mapOffMin) { ui.mapOffMin = off; mapDirty = true; }
+      }
+      break;
+    case T_SET:
+      if (tch.dragging || abs(dy) > 6) {
+        tch.dragging = true;
+        int s = constrain(tch.listScroll0 - dy, 0, setMaxScroll());
+        if (s != ui.setScroll) { ui.setScroll = s; drawAll(); }
+      }
+      break;
     case T_ART:
       if (!tch.moved && !tch.longDone && millis() - tch.t0 > 2000) {
         tch.longDone = true;
@@ -629,8 +936,13 @@ void onTouchUp() {
   int x = tch.x, y = tch.y;
   switch (tch.kind) {
     case T_TOP:
-      // tap on the "Update" pill -> device page
-      if (!tch.moved && updateAvailable(ui) && x > 240 && ui.page != 2) slideTo(2, 1);
+      if (tch.moved) break;
+      if (updateAvailable(ui) && y < TOP_H) {
+        // tap on the "Update" pill -> settings page
+        bool hit = ui.page == 1 ? (x < UPDATE_PILL_X_MAP + 76) : (x > 240);
+        if (hit && ui.page != 2) { slideTo(2, 1); break; }
+      }
+      if (ui.page == 1) toggleWeather();
       break;
     case T_SCRUB: {
       char c[24];
@@ -662,32 +974,21 @@ void onTouchUp() {
         }
       }
       break;
-    case T_DEVICE:
-      if (!tch.moved) {
-        if (y >= DEV_CARD1_Y && y < DEV_CARD1_Y + DEV_ROW_H && updateAvailable(ui) && x > 180) {
-          queueCmd("ota");
-        } else if (y >= DEV_CARD2_Y && y < DEV_CARD2_Y + DEV_ROW_H * 3) {
-          int row = (y - DEV_CARD2_Y) / DEV_ROW_H;
-          if (row == 0) {
-            ui.invert = !ui.invert;
-            prefs.putBool("inv", ui.invert);
-            gfx->invertDisplay(ui.invert);
-          } else if (row == 1) {
-            ui.anim = !ui.anim;
-            prefs.putBool("anim", ui.anim);
-          } else {
-            ui.flipped = !ui.flipped;
-            prefs.putBool("flip", ui.flipped);
-            applyRotation();
-          }
-          drawAll();
-        }
-      }
+    case T_LOCLIST:
+      if (!tch.moved) locPick(ui.locScroll + (tch.y0 - PL_TOP) / PL_ROW_H);
+      break;
+    case T_MAP:
+      if (!tch.dragging) toggleWeather();
+      else glideAt = millis() + 5000;   // glide back to "now" after 5 seconds
+      break;
+    case T_SET:
+      if (!tch.dragging && !tch.moved) settingsTap(tch.x0, tch.y0);
       break;
     default:
       break;
   }
   tch.kind = T_NONE;
+  tch.dragging = false;
 }
 
 void handleTouch() {
@@ -718,12 +1019,13 @@ void handleTouch() {
 // ================================================================
 // Animation / periodic updates (called with mtx held)
 // ================================================================
-const char *DAYS[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
-const char *MONTHS[] = {"January", "February", "March", "April", "May", "June", "July",
-                        "August", "September", "October", "November", "December"};
-
 uint32_t lastMarquee = 0, marqueePauseUntil = 0, toastUntil = 0;
-int lastBarPx = -1, lastSec = -1, lastMinute = -1;
+int lastBarPx = -1, lastSec = -1;
+uint32_t lastMapDraw = 0, lastWxStep = 0, lastBriAt = 0;
+int64_t lastMapMinute = -1;
+int prevStopped = -1;          // -1 = not known yet
+uint32_t stoppedAt = 0;
+float briSmooth = -1;
 
 void updateStatus() {
   char st[48] = "", sub[64] = "";
@@ -737,7 +1039,83 @@ void updateStatus() {
   if (strcmp(st, ui.status) != 0 || strcmp(sub, ui.statusSub) != 0) {
     strcpy(ui.status, st);
     strcpy(ui.statusSub, sub);
-    nf.full = true;
+    if (ui.page == 0) nf.full = true;
+  }
+}
+
+// Current time in seconds (UTC): from the internet (NTP), or from the PC.
+bool currentUtc(int64_t &out) {
+  time_t t = time(nullptr);
+  if (t > 1700000000) { out = t; return true; }
+  if (nf.epoch > 0) { out = nf.epoch + (millis() - nf.epochAt) / 1000; return true; }
+  return false;
+}
+
+// When music stops for 5 seconds: slide to the map. When it starts again: back to Now Playing.
+void autoSwitch(uint32_t now) {
+  if (!nf.pcOk) return;
+  int stopped = (!ui.active || !ui.playing) ? 1 : 0;
+  if (stopped != prevStopped) {
+    if (stopped) stoppedAt = now ? now : 1;
+    else {
+      stoppedAt = 0;
+      if (prevStopped == 1 && ui.page == 1 && !tch.down && !ui.locOpen) slideTo(0, -1);
+    }
+    prevStopped = stopped;
+  }
+  if (stoppedAt && now - stoppedAt > 5000) {
+    stoppedAt = 0;
+    if (ui.page == 0 && !tch.down && !ui.plOpen && !ui.locOpen) slideTo(1, 1);
+  }
+}
+
+// Auto-brightness from the light sensor on GPIO 34 (off unless turned on in Settings).
+void autoBrightness(uint32_t now) {
+  if (!ui.autoBri || now - lastBriAt < 250) return;
+  lastBriAt = now;
+  int raw = analogRead(34);                   // on the CYD: more light -> lower reading
+  float light = 1.0f - constrain(raw, 0, 1200) / 1200.0f;
+  briSmooth = briSmooth < 0 ? light : briSmooth * 0.85f + light * 0.15f;
+  applyBacklight(40 + (int)(215 * briSmooth));
+}
+
+void animateMap(uint32_t now) {
+  int64_t utc;
+  bool ok = currentUtc(utc);
+  // weather panel slide
+  if (ui.wxPos != wxTarget) {
+    float step = (now - lastWxStep) / 300.0f;
+    if (step > 0.25f) step = 0.25f;
+    ui.wxPos += ui.wxPos < wxTarget ? step : -step;
+    if (ui.wxPos > 1) ui.wxPos = 1;
+    if (ui.wxPos < 0) ui.wxPos = 0;
+    if (fabsf(ui.wxPos - wxTarget) < 0.02f) ui.wxPos = wxTarget;
+    drawRegion(0, WX_Y - 2, WX_W + WX_X_OPEN + 4, WX_H + 4);
+  }
+  lastWxStep = now;
+  if (wxTarget > 0.5f && !tch.down && now - wxOpenedAt > 10000) wxTarget = 0;   // hide after 10 s
+
+  // glide back to "now" 5 s after a time drag
+  if (!tch.dragging && ui.mapOffMin != 0 && glideAt && (int32_t)(now - glideAt) >= 0) {
+    if (!gliding) { gliding = true; glideFrom = ui.mapOffMin; glideT0 = now; }
+    float t = (now - glideT0) / 1200.0f;
+    if (t >= 1) { ui.mapOffMin = 0; gliding = false; glideAt = 0; }
+    else {
+      float e = t < 0.5f ? 4 * t * t * t : 1 - powf(-2 * t + 2, 3) / 2;   // ease in-out
+      ui.mapOffMin = glideFrom * (1 - e);
+    }
+    mapDirty = true;
+  }
+
+  // redraw the whole map when dragged, every 30 s (the sun moves), and when the minute changes
+  int64_t minute = ok ? (utc + ui.tzoff) / 60 : -1;
+  if (mapDirty || minute != lastMapMinute || now - lastMapDraw > 30000 || ok != ui.timeValid) {
+    mapDirty = false;
+    lastMapMinute = minute;
+    lastMapDraw = now;
+    ui.timeValid = ok;
+    if (ok) ui.utc = utc;
+    drawAll();
   }
 }
 
@@ -749,19 +1127,20 @@ void animate() {
   if (ui.durMs > 0 && pos > ui.durMs) pos = ui.durMs;
   ui.posMs = pos;
 
-  // clock
-  if (nf.epoch > 0) {
-    time_t t = nf.epoch + nf.tzoff + (now - nf.epochAt) / 1000;
-    struct tm tmv;
-    gmtime_r(&t, &tmv);
-    ui.hh = tmv.tm_hour; ui.mm = tmv.tm_min; ui.ss = tmv.tm_sec;
-    ui.timeValid = true;
-    snprintf(ui.dateStr, sizeof(ui.dateStr), "%s, %s %d", DAYS[tmv.tm_wday], MONTHS[tmv.tm_mon], tmv.tm_mday);
+  // time (the map page sets it itself, so the whole screen uses one moment)
+  if (ui.page != 1) {
+    int64_t utc;
+    ui.timeValid = currentUtc(utc);
+    if (ui.timeValid) ui.utc = utc;
   }
+  if (!nf.tzSaved && nf.epoch > 0) { nf.tzSaved = true; prefs.putInt("tz", (int)ui.tzoff); }
+
+  autoBrightness(now);
 
   if (nf.full) {
     nf.full = false; nf.icons = false; nf.top = false;
     lastBarPx = -1;
+    lastMapDraw = now;
     drawAll();
   }
   if (nf.toastNew) {
@@ -771,10 +1150,14 @@ void animate() {
     drawAll();
   }
   if (ui.toastOn && now > toastUntil) { ui.toastOn = false; drawAll(); }
-  if (ui.status[0] || ui.plOpen || ui.otaProgress >= 0) return;
+  if (ui.plOpen || ui.locOpen || ui.otaProgress >= 0) return;
+
+  autoSwitch(now);
   if (nf.top) { nf.top = false; drawRegion(0, 0, SCR_W, TOP_H); }
 
-  if (ui.page == 0 && ui.active) {
+  if (ui.page == 1) { animateMap(now); return; }
+
+  if (ui.page == 0 && ui.active && !ui.status[0]) {
     if (nf.icons) { nf.icons = false; redrawIcons(); }
     // progress bar: redraw when it moves a pixel or the seconds change
     int show = ui.scrubbing ? ui.scrubMs : ui.posMs;
@@ -797,8 +1180,6 @@ void animate() {
         if (t.offset == 0) marqueePauseUntil = now + 2000;
       }
     }
-  } else if (ui.page == 1) {
-    if (ui.mm != lastMinute) { lastMinute = ui.mm; drawRegion(0, 40, SCR_W, 150); }
   }
 }
 
@@ -851,6 +1232,7 @@ void setupWiFi() {
   wm.setConnectTimeout(20);
   if (!wm.autoConnect("DeskCYD-Setup")) ESP.restart();
   WiFi.setAutoReconnect(true);
+  configTime(0, 0, "pool.ntp.org", "time.google.com");   // clock for the map, even without the PC
   Serial.print("Wi-Fi OK, my IP: ");
   Serial.println(WiFi.localIP());
   udp.begin(DISCOVERY_PORT);
@@ -882,10 +1264,20 @@ void setup() {
   ui.flipped = prefs.getBool("flip", false);
   ui.invert = prefs.getBool("inv", true);
   ui.anim = prefs.getBool("anim", true);
+  ui.unitC = prefs.getBool("unitC", false);
+  ui.h24 = prefs.getBool("h24", false);
+  ui.autoBri = prefs.getBool("abri", false);
+  ui.locNear = prefs.getBool("lnear", false);
+  if (prefs.isKey("lname")) {
+    prefs.getString("lname", ui.locName, sizeof(ui.locName));
+    ui.locLat = prefs.getFloat("llat", ui.locLat);
+    ui.locLon = prefs.getFloat("llon", ui.locLon);
+  }
+  ui.tzoff = prefs.getInt("tz", -5 * 3600);
   ui.fw = FW_VERSION;
 
-  pinMode(GFX_BL, OUTPUT);
-  digitalWrite(GFX_BL, HIGH);
+  ledcAttach(GFX_BL, 5000, 8);   // backlight with brightness control
+  applyBacklight(255);
   gfx->begin();
   applyRotation();
   gfx->invertDisplay(ui.invert);
